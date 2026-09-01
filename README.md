@@ -93,32 +93,165 @@ The score is capped at 75 in this version because the application does not prete
 | Service and area signals | 10 |
 | Verified local sources | 10 |
 
-## Architecture
+## Architecture decision: two valid product directions
 
-```text
-React / Next-compatible UI
-          │
-          ▼
-   POST /api/analyze
-          │
-          ├── Public-site crawler
-          │     ├── URL and SSRF validation
-          │     ├── bounded page discovery
-          │     └── titles, descriptions, schema, and visible text
-          │
-          ├── Local search pipeline
-          │     ├── DuckDuckGo HTML discovery
-          │     └── server-side source verification
-          │
-          ├── Provider adapter
-          │     ├── Alibaba Qwen
-          │     └── Groq-compatible models
-          │
-          └── Deterministic evidence scoring
-                  │
-                  ▼
-       Priorities + citations + content brief
+The platform can be built in two different ways. They share the same SaaS foundation, integrations, evidence store, and approval controls, but the execution model is different.
+
+- **Direction A — Workflow-first:** predefined, observable steps execute in a known order.
+- **Direction B — Agent Harness:** an Agent interprets the goal, selects tools, evaluates evidence, and adapts its next action at runtime.
+
+This is a product decision rather than a simple implementation detail. The diagrams below are intended to make that decision explicit for the product owner.
+
+### Shared SaaS foundation
+
+Both directions can use the same underlying platform, allowing the execution model to change without rebuilding authentication, integrations, data storage, or the customer-facing workspace.
+
+```mermaid
+flowchart LR
+    subgraph client["Business Experience"]
+        dashboard["Owner Dashboard"]
+    end
+
+    subgraph gateway["Application Edge"]
+        application["Next.js SaaS Application"]
+    end
+
+    subgraph service["Shared Platform Services"]
+        identity["Identity and Tenant Service"]
+        execution["Execution Runtime"]
+        evidence["Evidence Collection Service"]
+        integration["Integration Service"]
+        provider["AI Provider Adapter"]
+        content["Content and Approval Workspace"]
+    end
+
+    subgraph datastore["Platform Data"]
+        postgres["PostgreSQL"]
+        objectStore["Object Storage"]
+        redis["Redis"]
+    end
+
+    subgraph async["Background Processing"]
+        jobQueue["Job Queue"]
+        scheduler["Scheduler"]
+    end
+
+    subgraph external["External Platforms"]
+        google["Google Business, Search Console, Analytics"]
+        seo["SEO and Rank Data Provider"]
+        models["OpenAI, Anthropic, Gemini, Qwen"]
+        publishing["WordPress, CRM, Email, SMS"]
+    end
+
+    dashboard -->|"HTTPS"| application
+    application -->|"Accounts"| identity
+    application -->|"Run or review"| execution
+    execution -->|"Collect signals"| evidence
+    execution -->|"Use integrations"| integration
+    execution -->|"Request synthesis"| provider
+    execution -->|"Save drafts"| content
+    identity -->|"Tenant data"| postgres
+    evidence -->|"Evidence records"| postgres
+    evidence -->|"Raw artifacts"| objectStore
+    execution -->|"Runtime state"| redis
+    content -->|"Drafts and approvals"| postgres
+    execution -.->|"Produce jobs"| jobQueue
+    scheduler -.->|"Trigger runs"| execution
+    jobQueue -.->|"Consume jobs"| evidence
+    integration -.->|"Google data"| google
+    integration -.->|"SEO data"| seo
+    provider -.->|"Model requests"| models
+    integration -.->|"Publish or sync"| publishing
 ```
+
+### Direction A — deterministic workflow execution
+
+The system runs a versioned sequence of steps. Each step has defined inputs, outputs, retries, timeouts, and approval rules. AI may perform analysis inside a step, but it does not decide the overall process.
+
+```mermaid
+flowchart LR
+    request["Business onboarding"] --> collect["Collect website and connected data"]
+    collect --> verify["Validate and normalize evidence"]
+    verify --> audit["Run deterministic audits"]
+    audit --> prioritize["Generate grounded priorities"]
+    prioritize --> draft["Create content drafts"]
+    draft --> approval{"Owner approval"}
+    approval -->|"Approved"| publish["Publish or export"]
+    approval -->|"Changes requested"| revise["Revise draft"]
+    revise --> approval
+    publish --> measure["Measure and schedule next cycle"]
+```
+
+**Best fit:** the initial MVP, Google data synchronization, scheduled audits, monthly plans, content approval, publishing, billing, and other flows where predictability matters.
+
+**Main advantages:** easier testing, lower operating cost, clear progress states, reliable retries, straightforward audit trails, and simpler support.
+
+**Main limitation:** new or unusual business situations require new workflow branches or code changes.
+
+### Direction B — adaptive Agent Harness
+
+The owner provides a goal rather than choosing a fixed automation. The Harness supplies context, tools, permissions, memory, budgets, and evidence requirements. The Agent decides what to inspect and which authorized tool to call next.
+
+```mermaid
+flowchart TB
+    goal["Business goal"] --> harness["Agent Harness Runtime"]
+
+    subgraph runtime["Controlled Agent Runtime"]
+        harness --> context["Context and tenant policy"]
+        context --> planner["Reason and plan"]
+        planner --> registry["Select from allowed tools"]
+        registry --> gate{"Permission and cost gate"}
+        gate -->|"Allowed"| execute["Execute one tool"]
+        gate -->|"Approval required"| human["Request human approval"]
+        human --> execute
+        execute --> evidence["Validate evidence and outcome"]
+        evidence --> complete{"Goal complete"}
+        complete -->|"No"| planner
+    end
+
+    execute --> tools["Crawl, Google, SEO, AI, publishing tools"]
+    evidence --> auditLog["Run state, tool calls, citations, and audit log"]
+    complete -->|"Yes"| result["Recommended actions or approved output"]
+```
+
+**Best fit:** open-ended competitive research, diagnosing an unfamiliar marketing problem, choosing among many available tools, creating a custom plan, and handling situations that cannot be fully anticipated in advance.
+
+**Main advantages:** more flexible, easier to extend with new tools, and capable of adapting the plan to the evidence discovered during a run.
+
+**Main limitation:** higher model cost and latency, more difficult testing, and a greater need for permission boundaries, budgets, stop conditions, evidence checks, run replay, and human approval.
+
+### Product-owner comparison
+
+| Decision area | Direction A: Workflow-first | Direction B: Agent Harness |
+| --- | --- | --- |
+| User asks for | A known operation | A business goal |
+| Execution path | Predefined and versioned | Chosen dynamically at runtime |
+| Predictability | High | Medium |
+| Flexibility | Medium | High |
+| MVP delivery risk | Lower | Higher |
+| Model usage and cost | Lower and easier to estimate | Higher and variable |
+| Testing | Step and contract based | Scenario, policy, and evaluation based |
+| Auditability | Naturally structured | Requires full run and tool-call tracing |
+| Best early use | Audits, plans, drafts, approvals, integrations | Research, diagnosis, custom strategy |
+| Failure control | Retries and explicit branches | Budgets, stop rules, permissions, and fallbacks |
+
+### Recommended evolution, while keeping both choices open
+
+```mermaid
+flowchart LR
+    foundation["Shared SaaS foundation"] --> decision{"Product-owner priority"}
+    decision -->|"Fast validation and predictable delivery"| workflow["Launch workflow-first MVP"]
+    decision -->|"Adaptive AI is the primary differentiator"| agent["Launch controlled Agent pilot"]
+    workflow --> signals["Collect real usage and failure data"]
+    signals --> hybrid["Add Agent mode for selected open-ended tasks"]
+    agent --> controls["Validate permissions, budgets, evidence, and evaluations"]
+    controls --> hybrid
+    hybrid --> product["Hybrid platform with workflow and Agent execution"]
+```
+
+My recommendation for a first release is **workflow-first with an Agent-ready foundation**. It gives pilot businesses a reliable product sooner, while keeping crawlers, Google integrations, SEO providers, AI generation, and publishing as reusable tools. Agent mode can then be introduced behind a feature flag for the few tasks where adaptation creates clear value.
+
+If the product owner wants the Agent itself to be the first market differentiator, Direction B is still viable, but the MVP scope should become narrower: fewer tools, strict step and token budgets, read-only execution by default, mandatory evidence citations, and human approval before any external write.
 
 ### Current implementation
 
